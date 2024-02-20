@@ -1,11 +1,10 @@
 /*-
  * Copyright 2003-2005 Colin Percival
  * Copyright 2012 Matthew Endsley
- * Copyright 2024 Erick Ortiz
  * All rights reserved
  *
  * Redistribution and use in source and binary forms, with or without
- * modification, are permitted providing that the following conditions 
+ * modification, are permitted providing that the following conditions
  * are met:
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
@@ -34,8 +33,13 @@
 
 #define MIN(x,y) (((x)<(y)) ? (x) : (y))
 
+static int64_t median3(int64_t a, int64_t b, int64_t c) {
+    return a < b ? (b < c ? b : a < c ? c : a) : b > c ? b : a > c ? c : a;
+}
+
 static void split(int64_t* indices, int64_t* values, int64_t start, int64_t length, int64_t offset) {
     int64_t i, j, k, pivotValue, tmp, rangeStart, rangeEnd;
+    int64_t pivotStartValue, pivotEndValue;
     if (length < 16) {
         for (k = start; k < start + length; k += j) {
             j = 1;
@@ -57,7 +61,24 @@ static void split(int64_t* indices, int64_t* values, int64_t start, int64_t leng
         }
         return;
     }
-    pivotValue = values[indices[start + length / 2] + offset];
+
+    /* Select pivot, algorithm by Bentley & McIlroy */
+    j = start + length / 2;
+    k = start + length - 1;
+    pivotValue = values[indices[j] + offset];
+    pivotStartValue = values[indices[start] + offset];
+    pivotEndValue = values[indices[k] + offset];
+    if (length > 40) {
+        /* Big array: Pseudomedian of 9 */
+        tmp = length / 8;
+        pivotValue = median3(pivotValue, values[indices[j - tmp] + offset], values[indices[j + tmp] + offset]);
+        pivotStartValue = median3(pivotStartValue, values[indices[start + tmp] + offset],
+                                  values[indices[start + tmp + tmp] + offset]);
+        pivotEndValue = median3(pivotEndValue, values[indices[k - tmp] + offset],
+                                values[indices[k - tmp - tmp] + offset]);
+    } /* Else medium array: Pseudomedian of 3 */
+    pivotValue = median3(pivotValue, pivotStartValue, pivotEndValue);
+
     rangeStart = 0;
     rangeEnd = 0;
     for (i = start; i < start + length; i++) {
@@ -115,7 +136,6 @@ static void quickSuffixSort(int64_t* suffixArray, int64_t* sortedGroup, const ui
     charFreq[0] = 0;
     for (i = 0; i < inputSize; i++)
         suffixArray[++charFreq[inputString[i]]] = i;
-    suffixArray[0] = inputSize;
     for (i = 0; i < inputSize; i++)
         sortedGroup[i] = charFreq[inputString[i]];
     sortedGroup[inputSize] = 0;
@@ -130,7 +150,8 @@ static void quickSuffixSort(int64_t* suffixArray, int64_t* sortedGroup, const ui
                 groupLen -= suffixArray[i];
                 i -= suffixArray[i];
             } else {
-                if (groupLen) suffixArray[i - groupLen] = -groupLen;
+                if (groupLen)
+                    suffixArray[i - groupLen] = -groupLen;
                 groupLen = sortedGroup[suffixArray[i]] + 1 - i;
                 split(suffixArray, sortedGroup, i, groupLen, height);
                 i += groupLen;
@@ -156,22 +177,26 @@ static int64_t calcMatchingLength(const uint8_t* oldData, int64_t oldDataSize, c
 static int64_t binSearchSuffixArray(const int64_t* suffixArray, const uint8_t* oldData, int64_t oldDataSize,
                                     const uint8_t* newData, int64_t newDataSize, int64_t start, int64_t end,
                                     int64_t* bestMatchPosition) {
-    int64_t x;
+    int64_t matchLengthStart, matchLengthEnd, midIndex, cmpsize;
+    int32_t res;
     if (end - start < 2) {
-        int64_t y;
-        x = calcMatchingLength(oldData + suffixArray[start], oldDataSize - suffixArray[start], newData, newDataSize);
-        y = calcMatchingLength(oldData + suffixArray[end], oldDataSize - suffixArray[end], newData, newDataSize);
-        if (x > y) {
+        matchLengthStart = calcMatchingLength(oldData + suffixArray[start], oldDataSize - suffixArray[start], newData, newDataSize);
+        matchLengthEnd = calcMatchingLength(oldData + suffixArray[end], oldDataSize - suffixArray[end], newData, newDataSize);
+        if (matchLengthStart > matchLengthEnd) {
             *bestMatchPosition = suffixArray[start];
-            return x;
+            return matchLengthStart;
         }
         *bestMatchPosition = suffixArray[end];
-        return y;
+        return matchLengthEnd;
     }
-    x = start + (end - start) / 2;
-    if (memcmp(oldData + suffixArray[x], newData,MIN(oldDataSize-suffixArray[x], newDataSize)) < 0)
-        return binSearchSuffixArray(suffixArray, oldData, oldDataSize, newData, newDataSize, x, end, bestMatchPosition);
-    return binSearchSuffixArray(suffixArray, oldData, oldDataSize, newData, newDataSize, start, x, bestMatchPosition);
+    midIndex = start + (end - start) / 2;
+    if (memcmp(oldData + suffixArray[midIndex], newData, MIN(oldDataSize - suffixArray[matchLengthStart], newDataSize)) < 0) {
+        cmpsize = MIN(oldDataSize - suffixArray[midIndex], newDataSize);
+        res = memcmp(oldData + suffixArray[midIndex], newData, cmpsize);
+        if (res < 0 || (res == 0 && cmpsize < newDataSize))
+            return binSearchSuffixArray(suffixArray, oldData, oldDataSize, newData, newDataSize, midIndex, end, bestMatchPosition);
+    }
+    return binSearchSuffixArray(suffixArray, oldData, oldDataSize, newData, newDataSize, start, midIndex, bestMatchPosition);
 }
 
 static void offsetToBytes(const int64_t offset, uint8_t* bytebuf) {
@@ -224,28 +249,29 @@ static int64_t writedata(struct bsdiff_stream* stream, const void* buffer, int64
 }
 
 struct bsdiff_request {
-    const uint8_t* old;
-    int64_t oldsize;
-    const uint8_t* new;
-    int64_t newsize;
+    const uint8_t* oldData;
+    int64_t oldDataSize;
+    const uint8_t* newData;
+    int64_t newDataSize;
     struct bsdiff_stream* stream;
-    int64_t* I;
+    int64_t* indices;
     uint8_t* buffer;
 };
 
 static int bsdiff_internal(const struct bsdiff_request req) {
     int64_t* suffix_array,* rank_array;
     int64_t currentScan, matchedPosition, matchedLength;
-    int64_t lastScan, lastMatchedPosition, lastOffset;
+    int64_t lastScan, lastMatchedPosition, lastOffset, lastWriteNewScan, lastWriteOldPosition;
+    int64_t currentControlBlock[3], nextControlBlock[3];
     int64_t oldscore, scoreCompare;
     int64_t score, scoreFront, lengthFront, scoreBack, lengthBack;
     int64_t overlapLength, scoreOverlap, lengthOverlap;
     int64_t i;
     uint8_t* diffBuf;
     uint8_t controlBuf[8 * 3];
-    if ((rank_array = req.stream->malloc((req.oldsize + 1) * sizeof(int64_t))) == NULL) return -1;
-    suffix_array = req.I;
-    quickSuffixSort(suffix_array, rank_array, req.old, req.oldsize);
+    if ((rank_array = req.stream->malloc((req.oldDataSize + 1) * sizeof(int64_t))) == NULL) return -1;
+    suffix_array = req.indices;
+    quickSuffixSort(suffix_array, rank_array, req.oldData, req.oldDataSize);
     req.stream->free(rank_array);
     diffBuf = req.buffer;
     /* Compute the differences, writing ctrl as we go */
@@ -255,48 +281,51 @@ static int bsdiff_internal(const struct bsdiff_request req) {
     lastScan = 0;
     lastMatchedPosition = 0;
     lastOffset = 0;
-    while (currentScan < req.newsize) {
+    lastWriteNewScan = 0;
+    lastWriteOldPosition = 0;
+    memset(currentControlBlock, 0, 3);
+    while (currentScan < req.newDataSize) {
         oldscore = 0;
-        for (scoreCompare = currentScan += matchedLength; currentScan < req.newsize; currentScan++) {
-            matchedLength = binSearchSuffixArray(suffix_array, req.old, req.oldsize, req.new + currentScan,
-                                                 req.newsize - currentScan,
-                                                 0, req.oldsize, &matchedPosition);
+        for (scoreCompare = currentScan += matchedLength; currentScan < req.newDataSize; currentScan++) {
+            matchedLength = binSearchSuffixArray(suffix_array, req.oldData, req.oldDataSize, req.newData + currentScan,
+                                                 req.newDataSize - currentScan,
+                                                 0, req.oldDataSize, &matchedPosition);
             for (; scoreCompare < currentScan + matchedLength; scoreCompare++)
-                if ((scoreCompare + lastOffset < req.oldsize) &&
-                    (req.old[scoreCompare + lastOffset] == req.new[scoreCompare]))
+                if (scoreCompare + lastOffset < req.oldDataSize &&
+                    req.oldData[scoreCompare + lastOffset] == req.newData[scoreCompare])
                     oldscore++;
-            if (((matchedLength == oldscore) && (matchedLength != 0)) ||
-                (matchedLength > oldscore + 8))
+            if ((matchedLength == oldscore && matchedLength != 0) ||
+                matchedLength > oldscore + 8)
                 break;
-            if ((currentScan + lastOffset < req.oldsize) &&
-                (req.old[currentScan + lastOffset] == req.new[currentScan]))
+            if (currentScan + lastOffset < req.oldDataSize &&
+                req.oldData[currentScan + lastOffset] == req.newData[currentScan])
                 oldscore--;
         }
-        if (matchedLength != oldscore || currentScan == req.newsize) {
+        if (matchedLength != oldscore || currentScan == req.newDataSize) {
             score = 0;
             scoreFront = 0;
             lengthFront = 0;
-            for (i = 0; (lastScan + i < currentScan) && (lastMatchedPosition + i < req.oldsize);) {
-                if (req.old[lastMatchedPosition + i] == req.new[lastScan + i]) score++;
+            for (i = 0; lastScan + i < currentScan && lastMatchedPosition + i < req.oldDataSize;) {
+                if (req.oldData[lastMatchedPosition + i] == req.newData[lastScan + i]) score++;
                 i++;
                 if (score * 2 - i > scoreFront * 2 - lengthFront) {
                     scoreFront = score;
                     lengthFront = i;
-                };
-            };
+                }
+            }
 
             lengthBack = 0;
-            if (currentScan < req.newsize) {
+            if (currentScan < req.newDataSize) {
                 score = 0;
                 scoreBack = 0;
                 for (i = 1; (currentScan >= lastScan + i) && (matchedPosition >= i); i++) {
-                    if (req.old[matchedPosition - i] == req.new[currentScan - i]) score++;
+                    if (req.oldData[matchedPosition - i] == req.newData[currentScan - i]) score++;
                     if (score * 2 - i > scoreBack * 2 - lengthBack) {
                         scoreBack = score;
                         lengthBack = i;
-                    };
-                };
-            };
+                    }
+                }
+            }
 
             if (lastScan + lengthFront > currentScan - lengthBack) {
                 overlapLength = (lastScan + lengthFront) - (currentScan - lengthBack);
@@ -304,47 +333,87 @@ static int bsdiff_internal(const struct bsdiff_request req) {
                 scoreOverlap = 0;
                 lengthOverlap = 0;
                 for (i = 0; i < overlapLength; i++) {
-                    if (req.new[lastScan + lengthFront - overlapLength + i] ==
-                        req.old[lastMatchedPosition + lengthFront - overlapLength + i])
+                    if (req.newData[lastScan + lengthFront - overlapLength + i] ==
+                        req.oldData[lastMatchedPosition + lengthFront - overlapLength + i])
                         score++;
-                    if (req.new[currentScan - lengthBack + i] ==
-                        req.old[matchedPosition - lengthBack + i])
+                    if (req.newData[currentScan - lengthBack + i] ==
+                        req.oldData[matchedPosition - lengthBack + i])
                         score--;
                     if (score > scoreOverlap) {
                         scoreOverlap = score;
                         lengthOverlap = i + 1;
-                    };
-                };
+                    }
+                }
 
                 lengthFront += lengthOverlap - overlapLength;
                 lengthBack -= lengthOverlap;
-            };
+            }
 
-            offsetToBytes(lengthFront, controlBuf);
-            offsetToBytes((currentScan - lengthBack) - (lastScan + lengthFront), controlBuf + 8);
-            offsetToBytes((matchedPosition - lengthBack) - (lastMatchedPosition + lengthFront), controlBuf + 16);
+            nextControlBlock[0] = lengthFront;
+            nextControlBlock[1] = currentScan - lengthBack - (lastScan + lengthFront);
+            nextControlBlock[2] = matchedPosition - lengthBack - (lastMatchedPosition + lengthFront);
 
-            /* Write control data */
-            if (writedata(req.stream, controlBuf, sizeof(controlBuf)))
-                return -1;
+            if (nextControlBlock[0]) {
+                if (currentControlBlock[0] || currentControlBlock[1] || currentControlBlock[2]) {
+                    offsetToBytes(currentControlBlock[0], controlBuf);
+                    offsetToBytes(currentControlBlock[1], controlBuf + 8);
+                    offsetToBytes(currentControlBlock[2], controlBuf + 16);
 
-            /* Write diff data */
-            for (i = 0; i < lengthFront; i++)
-                diffBuf[i] = req.new[lastScan + i] - req.old[lastMatchedPosition + i];
-            if (writedata(req.stream, diffBuf, lengthFront))
-                return -1;
+                    /* Write control data */
+                    if (writedata(req.stream, controlBuf, sizeof(controlBuf)))
+                        return -1;
 
-            /* Write extra data */
-            for (i = 0; i < (currentScan - lengthBack) - (lastScan + lengthFront); i++)
-                diffBuf[i] = req.new[lastScan + lengthFront + i];
-            if (writedata(req.stream, diffBuf, (currentScan - lengthBack) - (lastScan + lengthFront)))
-                return -1;
+                    /* Write diff data */
+                    for (i = 0; i < currentControlBlock[0]; i++)
+                        diffBuf[i] = req.newData[lastWriteNewScan + i] - req.oldData[lastWriteOldPosition + i];
+
+                    if (writedata(req.stream, diffBuf, currentControlBlock[0]))
+                        return -1;
+
+                    /* Write extra data */
+                    for (i = 0; i < currentControlBlock[1]; i++)
+                        diffBuf[i] = req.newData[lastWriteNewScan + currentControlBlock[0] + i];
+                    if (writedata(req.stream, diffBuf, currentControlBlock[1]))
+                        return -1;
+
+                    lastWriteNewScan = lastScan;
+                    lastWriteOldPosition = lastMatchedPosition;
+                }
+                currentControlBlock[0] = nextControlBlock[0];
+                currentControlBlock[1] = nextControlBlock[1];
+                currentControlBlock[2] = nextControlBlock[2];
+            } else {
+                currentControlBlock[1] += nextControlBlock[1];
+                currentControlBlock[2] += nextControlBlock[2];
+            }
 
             lastScan = currentScan - lengthBack;
             lastMatchedPosition = matchedPosition - lengthBack;
             lastOffset = matchedPosition - currentScan;
-        };
-    };
+        }
+    }
+
+    if (currentControlBlock[0] || currentControlBlock[1]) {
+        offsetToBytes(currentControlBlock[0], controlBuf);
+        offsetToBytes(currentControlBlock[1], controlBuf + 8);
+        offsetToBytes(currentControlBlock[2], controlBuf + 16);
+
+        /* Write control data */
+        if (writedata(req.stream, controlBuf, sizeof(controlBuf)))
+            return -1;
+
+        /* Write diff data */
+        for (i = 0; i < currentControlBlock[0]; i++)
+            diffBuf[i] = req.newData[lastWriteNewScan + i] - req.oldData[lastWriteOldPosition + i];
+        if (writedata(req.stream, diffBuf, currentControlBlock[0]))
+            return -1;
+
+        /* Write extra data */
+        for (i = 0; i < currentControlBlock[1]; i++)
+            diffBuf[i] = req.newData[lastWriteNewScan + currentControlBlock[0] + i];
+        if (writedata(req.stream, diffBuf, currentControlBlock[1]))
+            return -1;
+    }
 
     return 0;
 }
@@ -353,24 +422,24 @@ int bsdiff(const uint8_t* old, int64_t oldsize, const uint8_t* new, int64_t news
     int result;
     struct bsdiff_request req;
 
-    if ((req.I = stream->malloc((oldsize + 1) * sizeof(int64_t))) == NULL)
+    if ((req.indices = stream->malloc((oldsize + 1) * sizeof(int64_t))) == NULL)
         return -1;
 
     if ((req.buffer = stream->malloc(newsize + 1)) == NULL) {
-        stream->free(req.I);
+        stream->free(req.indices);
         return -1;
     }
 
-    req.old = old;
-    req.oldsize = oldsize;
-    req.new = new;
-    req.newsize = newsize;
+    req.oldData = old;
+    req.oldDataSize = oldsize;
+    req.newData = new;
+    req.newDataSize = newsize;
     req.stream = stream;
 
     result = bsdiff_internal(req);
 
     stream->free(req.buffer);
-    stream->free(req.I);
+    stream->free(req.indices);
 
     return result;
 }
@@ -464,7 +533,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    /* Write header (signature+newsize)*/
+    /* Write header (signature+newsize) */
     offsetToBytes(newsize, buf);
     if (fwrite("ENDSLEY/BSDIFF43", 16, 1, pf) != 1 ||
         fwrite(buf, sizeof(buf), 1, pf) != 1) {
